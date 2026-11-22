@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#1f4e8c">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="TAMER TAKİP">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<title>TAMER TAKİP</title>
+<style>
+:root{--bg:#f4f5f7;--card:#fff;--ink:#1d2330;--mut:#6b7280;--line:#e3e6eb;--acc:#1f4e8c;--acc2:#e8eef8;--pos:#127a3a;--neg:#b42318;--warn:#a15c00;--warnbg:#fff4e0}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.45 "Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--ink)}
+header{position:sticky;top:0;z-index:5;background:var(--acc);color:#fff;display:flex;align-items:center;gap:16px;padding:0 16px;height:52px;flex-wrap:wrap}
+header h1{font-size:18px;margin:0;letter-spacing:.5px;white-space:nowrap}
+nav{display:flex;gap:2px;flex:1;overflow-x:auto}
+nav button{background:none;border:0;color:#dbe6f7;padding:15px 12px;font:inherit;cursor:pointer;white-space:nowrap;border-bottom:3px solid transparent}
+nav button.on{color:#fff;border-bottom-color:#fff;font-weight:600}
+header .right{display:flex;gap:10px;align-items:center;white-space:nowrap}
+header .right a{color:#fff}
+header select{font:inherit;padding:3px 6px;border-radius:4px;border:0}
+main{padding:16px;max-width:1700px;margin:0 auto}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px 16px;margin-bottom:14px}
+.card h2{font-size:15px;margin:0 0 10px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:14px}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
+.kpi .l{color:var(--mut);font-size:12px}.kpi .v{font-size:22px;font-weight:600;margin-top:2px}
+.tools{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+input,select,button,textarea{font:inherit}
+.tools input[type=search],.tools input[type=text]{padding:6px 9px;border:1px solid var(--line);border-radius:5px;min-width:220px}
+.tools select{padding:6px;border:1px solid var(--line);border-radius:5px;max-width:320px}
+.btn{background:var(--acc);color:#fff;border:0;border-radius:5px;padding:7px 13px;cursor:pointer}
+.btn.sec{background:var(--acc2);color:var(--acc)}
+.btn.red{background:#fde8e6;color:var(--neg)}
+.tw{overflow:auto;max-height:calc(100vh - 230px);border:1px solid var(--line);border-radius:6px;background:#fff}
+table{border-collapse:collapse;width:100%}
+th,td{padding:6px 9px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{background:#f0f2f5;position:sticky;top:0;z-index:1;font-weight:600;font-size:12.5px;white-space:nowrap}
+td.n,th.n{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+tr.tot td{font-weight:700;background:#f7f8fa}
+tr.sub td{font-weight:600;background:#fafbfc}
+.tw td:first-child{min-width:170px}
+tr.click{cursor:pointer}tr.click:hover td{background:var(--acc2)}
+.pos{color:var(--pos)}.neg{color:var(--neg)}.mut{color:var(--mut)}
+.tag{display:inline-block;padding:1px 7px;border-radius:9px;font-size:11.5px;background:#eef0f3;color:#444}
+.tag.w{background:var(--warnbg);color:var(--warn)}
+.warn{background:var(--warnbg);border:1px solid #f3d19c;color:#5c3b00;border-radius:6px;padding:9px 12px;margin-bottom:8px}
+.modal{position:fixed;inset:0;background:rgba(20,25,35,.45);display:flex;align-items:flex-start;justify-content:center;padding:30px 12px;z-index:20;overflow:auto}
+.modal.hidden{display:none}
+.modal .box{background:#fff;border-radius:10px;max-width:1100px;width:100%;padding:18px 20px;position:relative}
+.modal .x{position:absolute;right:12px;top:8px;border:0;background:none;font-size:26px;cursor:pointer;color:var(--mut)}
+.modal h3{margin:0 0 10px;padding-right:30px}
+.drop{border:2px dashed #b9c4d6;border-radius:8px;padding:22px;text-align:center;color:var(--mut);background:#fafbfd;cursor:pointer}
+.drop.over{background:var(--acc2);border-color:var(--acc)}
+#toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#222;color:#fff;padding:9px 16px;border-radius:6px;display:none;z-index:30;max-width:80vw}
+#toast.err{background:var(--neg)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:900px){.grid2{grid-template-columns:1fr}}
+td select{padding:3px;border:1px solid var(--line);border-radius:4px;max-width:190px}
+td input.party{padding:3px 6px;border:1px solid var(--line);border-radius:4px;width:210px}
+td input.dv{width:110px;text-align:right;padding:3px 6px;border:1px solid #e7d47a;background:#fffbe6;border-radius:4px}
+.log{font-family:Consolas,monospace;font-size:12.5px;white-space:pre-wrap;background:#f7f8fa;border:1px solid var(--line);border-radius:6px;padding:10px;max-height:300px;overflow:auto}
+.more{margin-top:8px}
+label.chk{display:inline-flex;gap:5px;align-items:center;cursor:pointer}
+@media(max-width:760px){
+  header{height:auto;padding:6px 10px;gap:4px 10px}
+  header h1{font-size:16px}
+  nav{order:3;width:100%;flex:none}
+  nav button{padding:9px 10px}
+  header .right{font-size:12px;flex-wrap:wrap;gap:6px}
+  main{padding:8px}
+  .card{padding:10px}
+  .kpis{grid-template-columns:1fr 1fr;gap:8px}
+  .kpi .v{font-size:17px}
+  .tools input[type=search],.tools input[type=text]{min-width:0;flex:1 1 160px}
+  .tw{max-height:none}
+  th,td{padding:5px 6px;font-size:13px}
+  .modal{padding:10px 6px}.modal .box{padding:14px 12px}
+}
+</style>
+<script src="lib/xlsx.full.min.js"></script>
+<script src="lib/jszip.min.js"></script>
+<script src="lib/chart.umd.min.js"></script>
+</head>
+<body>
+<header>
+  <h1>TAMER TAKİP</h1>
+  <nav id="tabs"></nav>
+  <div class="right">
+    <select id="year" title="Yıl"></select>
+    <label class="chk"><input type="checkbox" id="kdv" checked> KDV dahil</label>
+    <span id="sync" style="font-size:12px;opacity:.9"></span>
+  </div>
+</header>
+<main id="view"><div class="card">Yükleniyor…</div></main>
+<div id="modal" class="modal hidden"><div class="box"><button class="x" onclick="closeModal()">×</button><div id="mbody"></div></div></div>
+<div id="toast"></div>
+<script src="app.js?v=21"></script>
+</body>
+</html>
