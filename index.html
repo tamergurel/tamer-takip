@@ -76,6 +76,7 @@ label.chk{display:inline-flex;gap:5px;align-items:center;cursor:pointer}
   .kpis{grid-template-columns:1fr 1fr;gap:8px}
   .kpi .v{font-size:17px}
   .tools input[type=search],.tools input[type=text]{min-width:0;flex:1 1 160px}
+  .tools[style*="column"] input,.tools[style*="column"] select{flex:none}
   .tw{max-height:none}
   th,td{padding:5px 6px;font-size:13px}
   .modal{padding:10px 6px}.modal .box{padding:14px 12px}
@@ -98,6 +99,6 @@ label.chk{display:inline-flex;gap:5px;align-items:center;cursor:pointer}
 <main id="view"><div class="card">Yükleniyor…</div></main>
 <div id="modal" class="modal hidden"><div class="box"><button class="x" onclick="closeModal()">×</button><div id="mbody"></div></div></div>
 <div id="toast"></div>
-<script src="app.js?v=21"></script>
+<script src="app.js?v=22"></script>
 </body>
 </html>
