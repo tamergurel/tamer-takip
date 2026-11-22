@@ -65,6 +65,7 @@ td input.dv{width:110px;text-align:right;padding:3px 6px;border:1px solid #e7d47
 .log{font-family:Consolas,monospace;font-size:12.5px;white-space:pre-wrap;background:#f7f8fa;border:1px solid var(--line);border-radius:6px;padding:10px;max-height:300px;overflow:auto}
 .more{margin-top:8px}
 label.chk{display:inline-flex;gap:5px;align-items:center;cursor:pointer}
+body.ro td select,body.ro td input,body.ro .rw{pointer-events:none;opacity:.55}
 @media(max-width:760px){
   header{height:auto;padding:6px 10px;gap:4px 10px}
   header h1{font-size:16px}
@@ -99,6 +100,6 @@ label.chk{display:inline-flex;gap:5px;align-items:center;cursor:pointer}
 <main id="view"><div class="card">Yükleniyor…</div></main>
 <div id="modal" class="modal hidden"><div class="box"><button class="x" onclick="closeModal()">×</button><div id="mbody"></div></div></div>
 <div id="toast"></div>
-<script src="app.js?v=22"></script>
+<script src="app.js?v=23"></script>
 </body>
 </html>
