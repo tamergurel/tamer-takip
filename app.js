@@ -219,7 +219,7 @@ async function loadFromCloud() {
   st.tx = tx.map(t => ({ k: t.k, src: t.src, acc: t.acc, date: t.date, desc: t.descr || '', sector: t.sector || '', amt: n(t.amt), file: t.file, cat: t.man ? (t.cat || '') : '', party: t.man ? t.party : null, man: !!t.man, eff: null, _c: t.created_at }))
     .sort((a, b) => (a._c || '').localeCompare(b._c || ''));
   st.tx.forEach(t => delete t._c);
-  for (const p of par) st.parties[p.key] = { key: p.key, name: p.name, vkn: p.vkn || '', cat: p.cat || 'Diğer', catSet: !!p.cat_set, devir: n(p.devir) };
+  for (const p of par) st.parties[p.key] = { key: p.key, name: p.name, vkn: p.vkn || '', cat: p.cat || 'Diğer', catSet: !!p.cat_set, devir: n(p.devir), phone: p.phone || '', email: p.email || '', term: p.term_days == null ? null : Number(p.term_days) };
   st.rules = rules.map(r => ({ kw: r.kw, cat: r.cat, party: r.party || null, at: r.created_at }));
   for (const c of counts) (st.counts[c.pkey] = st.counts[c.pkey] || []).push({ id: c.id, d: c.d, q: n(c.q) });
   st.planned = planned.map(p => ({ id: p.id, kind: p.kind, due: p.due, amount: n(p.amount), party: p.party, invoice_no: p.invoice_no, descr: p.descr || '', status: p.status, recurrence: p.recurrence, src: p.src }));
@@ -603,7 +603,7 @@ function supDetail(vkn) {
   const inv = S.invoices.filter(i => i.vkn === vkn && i.date.startsWith(y)).sort((a, b) => a.date.localeCompare(b.date));
   const byM = groupBy(inv, i => mIdx(i.date));
   const prods = aggProducts(S.lines.filter(l => l.vkn === vkn && l.date.startsWith(y)));
-  openModal(`<h3>${esc(p.name)}</h3><div class="mut" style="margin-bottom:10px">VKN/TCKN: ${esc(vkn)} · Kategori: ${esc(p.cat || '')} · ${y}</div>
+  openModal(`<h3>${esc(p.name)}</h3><div class="mut" style="margin-bottom:10px">VKN/TCKN: ${esc(vkn)} · Kategori: ${esc(p.cat || '')} · ${y}</div>${contactLine(S.parties[vkn])}
   <div class="tw" style="max-height:340px"><table><tr><th>Ay</th><th>Fatura No</th><th>Tarih</th><th class="n">Matrah</th><th class="n">KDV</th><th class="n">Toplam</th></tr>
   ${byM.map(([m, a]) => a.map(i => `<tr><td>${AY[m]}</td><td>${esc(i.no)}${i.src === 'PDF' ? ' <span class="tag w">PDF</span>' : ''}${i.type === 'IADE' ? ' <span class="tag w">İADE</span>' : ''}</td><td>${dTR(i.date)}</td><td class="n">${fmt(i.net)}</td><td class="n">${fmt(i.vat)}</td><td class="n">${fmt(i.total)}</td></tr>`).join('') +
     `<tr class="sub"><td>${AY[m]} toplamı</td><td>${a.length} fatura</td><td></td><td class="n">${fmt(sum(a, i => i.net))}</td><td class="n">${fmt(sum(a, i => i.vat))}</td><td class="n">${fmt(sum(a, i => i.total))}</td></tr>`).join('')}
@@ -677,12 +677,13 @@ function vCari() {
   const filt = () => { const q = norm(CF.q); let rs = rows.filter(r => (!q || norm(r.p.name).includes(q) || r.p.key.includes(q)) && (CF.only === 'all' || (CF.only === 'borc' && r.bal > 0.5) || (CF.only === 'eksi' && r.bal < -0.5) || (CF.only === 'odenen' && r.nP))); rs.sort(CF.sort === 'name' ? (a, b) => a.p.name.localeCompare(b.p.name, TR) : CF.sort === 'f' ? (a, b) => b.f - a.f : (a, b) => b.bal - a.bal); return rs; };
   const draw = () => {
     const rs = filt();
-    $('#ct').innerHTML = `<tr><th>Cari</th><th>Kategori</th><th class="n">Devir</th><th class="n">Faturalar</th><th class="n">Ödemeler</th><th class="n">Bakiye</th><th>Son fatura</th><th>Son ödeme</th></tr>` +
+    $('#ct').innerHTML = `<tr><th>Cari</th><th>Telefon</th><th>Kategori</th><th class="n">Devir</th><th class="n">Faturalar</th><th class="n">Ödemeler</th><th class="n">Bakiye</th><th>Son fatura</th><th>Son ödeme</th></tr>` +
       rs.map(r => `<tr><td><a href="javascript:void 0" onclick="cariEkstre('${esc(r.p.key)}')">${esc(r.p.name)}</a>${r.nI ? '' : ' <span class="tag w">e-fatura yok</span>'}</td>
+      <td style="white-space:nowrap">${r.p.phone ? `<a href="tel:${esc(String(r.p.phone).replace(/[^\d+]/g, ''))}">${esc(r.p.phone)}</a>` : ''}</td>
       <td><select data-k="${esc(r.p.key)}" class="cat">${SUP_CATS.map(c => `<option ${c === r.p.cat ? 'selected' : ''}>${c}</option>`).join('')}</select></td>
       <td class="n"><input class="dv" data-k="${esc(r.p.key)}" value="${r.p.devir ? fmt(r.p.devir) : ''}" placeholder="0,00"></td>
       <td class="n">${fmt(r.f)}</td><td class="n">${fmt(r.o)}</td><td class="n ${r.bal > 0.5 ? 'neg' : r.bal < -0.5 ? 'pos' : ''}"><b>${fmt(r.bal)}</b></td><td>${dTR(r.lastI)}</td><td>${dTR(r.lastP)}</td></tr>`).join('') +
-      `<tr class="tot"><td>TOPLAM (${rs.length})</td><td></td><td class="n">${fmt(sum(rs, r => r.p.devir || 0))}</td><td class="n">${fmt(sum(rs, r => r.f))}</td><td class="n">${fmt(sum(rs, r => r.o))}</td><td class="n">${fmt(sum(rs, r => r.bal))}</td><td></td><td></td></tr>`;
+      `<tr class="tot"><td>TOPLAM (${rs.length})</td><td></td><td></td><td class="n">${fmt(sum(rs, r => r.p.devir || 0))}</td><td class="n">${fmt(sum(rs, r => r.f))}</td><td class="n">${fmt(sum(rs, r => r.o))}</td><td class="n">${fmt(sum(rs, r => r.bal))}</td><td></td><td></td></tr>`;
     $('#ct').querySelectorAll('select.cat').forEach(s => s.onchange = () => { if (!guard()) return vCari(); S.parties[s.dataset.k].cat = s.value; S.parties[s.dataset.k].catSet = true; mark('par', s.dataset.k); save(); toast('Kategori kaydedildi'); });
     $('#ct').querySelectorAll('input.dv').forEach(inp => inp.onchange = () => { if (!guard()) return vCari(); const v = parseTR(inp.value); S.parties[inp.dataset.k].devir = isNaN(v) ? 0 : v; mark('par', inp.dataset.k); save(); vCari(); toast('Devir kaydedildi'); });
   };
@@ -690,11 +691,20 @@ function vCari() {
   $('#ex').onclick = () => xlsxDownload('Cari', [['Cari', 'VKN', 'Kategori', 'Devir', 'Faturalar', 'Ödemeler', 'Bakiye', 'Son fatura', 'Son ödeme'], ...filt().map(r => [r.p.name, r.p.vkn, r.p.cat, r.p.devir || 0, r2(r.f), r2(r.o), r2(r.bal), dTR(r.lastI), dTR(r.lastP)])]);
   draw();
 }
+// carinin iletişim satırı (telefona dokununca arar, e-postaya dokununca e-posta açar)
+function contactLine(p) {
+  if (!p) return '';
+  const a = [];
+  if (p.phone) a.push(`☎ <a href="tel:${esc(String(p.phone).replace(/[^\d+]/g, ''))}">${esc(p.phone)}</a>`);
+  if (p.email) a.push(`✉ <a href="mailto:${esc(p.email)}">${esc(p.email)}</a>`);
+  if (p.term != null) a.push(`Ödeme vadesi: ${esc(p.term)} gün`);
+  return a.length ? `<div style="margin:-4px 0 10px">${a.join(' · ')}</div>` : '';
+}
 function cariEkstre(key) {
   const p = S.parties[key];
   const items = [...S.invoices.filter(i => i.vkn === key).map(i => ({ d: i.date, t: 'Fatura ' + i.no, b: i.pay, a: 0 })), ...S.tx.filter(t => t.party === key && t.cat === 'Tedarikçi ödemesi').map(t => ({ d: t.date, t: t.acc + ' – ' + t.desc, b: 0, a: -txAmt(t) }))].sort((x, y) => x.d.localeCompare(y.d) || (y.b - x.b));
   let bal = p.devir || 0;
-  openModal(`<h3>${esc(p.name)} – hesap ekstresi</h3><div class="tw" style="max-height:65vh"><table><tr><th>Tarih</th><th>İşlem</th><th class="n">Borç (fatura)</th><th class="n">Alacak (ödeme)</th><th class="n">Bakiye</th></tr>
+  openModal(`<h3>${esc(p.name)} – hesap ekstresi</h3>${contactLine(p)}<div class="tw" style="max-height:65vh"><table><tr><th>Tarih</th><th>İşlem</th><th class="n">Borç (fatura)</th><th class="n">Alacak (ödeme)</th><th class="n">Bakiye</th></tr>
   <tr><td></td><td>Devir</td><td></td><td></td><td class="n">${fmt(bal)}</td></tr>
   ${items.map(x => { bal += x.b - x.a; return `<tr><td>${dTR(x.d)}</td><td>${esc(x.t)}</td><td class="n">${x.b ? fmt(x.b) : ''}</td><td class="n">${x.a ? fmt(x.a) : ''}</td><td class="n">${fmt(bal)}</td></tr>`; }).join('')}
   <tr class="tot"><td></td><td>Bakiye</td><td class="n">${fmt(sum(items, x => x.b))}</td><td class="n">${fmt(sum(items, x => x.a))}</td><td class="n">${fmt(bal)}</td></tr></table></div>`);
@@ -931,7 +941,9 @@ function planNewForm() {
 function planFromInvoices() {
   if (!guard()) return;
   const t = todayISO(); const have = new Set((S.planned || []).map(p => p.invoice_no).filter(Boolean));
-  const cand = S.invoices.filter(i => i.due && /^\d{4}-\d{2}-\d{2}$/.test(i.due) && i.due >= t && !have.has(i.no) && i.pay > 0);
+  // faturada vade yoksa carinin ödeme vadesi (gün) kullanılır
+  const dueOf = i => (i.due && /^\d{4}-\d{2}-\d{2}$/.test(i.due)) ? i.due : (S.parties[i.vkn] && S.parties[i.vkn].term != null ? addDays(i.date, S.parties[i.vkn].term) : '');
+  const cand = S.invoices.filter(i => dueOf(i) >= t && !have.has(i.no) && i.pay > 0).map(i => Object.assign({}, i, { due: dueOf(i) }));
   if (!cand.length) return toast('Vadesi bugünden sonra olan, planı olmayan e-fatura yok.');
   if (!confirm(`${cand.length} vadeli e-fatura için plan oluşturulsun mu? (Toplam ${fmt(sum(cand, i => i.pay))} ₺)`)) return;
   for (const i of cand) { const np = { id: 'I:' + i.ettn, kind: 'odeme', due: i.due, amount: i.pay, party: i.vkn, invoice_no: i.no, descr: pName(i.vkn) + ' · ' + i.no, status: 'bekliyor', recurrence: 'yok', src: 'e-fatura' }; S.planned.push(np); mark('plan', np.id); }
