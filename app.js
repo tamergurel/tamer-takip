@@ -196,6 +196,7 @@ function syncBadge() {
 }
 let saveT;
 function save() {
+  ALLOC = null;
   clearTimeout(saveT);
   saveT = setTimeout(() => {
     DB.put('state', JSON.stringify(S)).catch(e => toast('Kaydedilemedi: ' + e, true));
@@ -383,10 +384,110 @@ function reclassifyAll() {
     if (t.man && t.eff != null) { const m = t.desc.match(/([\d.]+(?:,\d+)?) TL'lik işlemin/); if (m) ctx.inst.add(t.acc + '|' + t.date + '|' + parseFloat(m[1].replace(/\./g, '').replace(',', '.'))); }
   }
   for (const t of S.tx) classifyTx(t, ctx);
+  linkManual(); ALLOC = null;
 }
 const txAmt = t => (t.eff != null ? t.eff : t.amt);
 // Ziraat POS satırı: "... Komisyon : 2,92 ..." → bankaya net yatar, komisyon açıklamada
 function posComm(t) { const m = t.desc.match(/(?:Komisyon\s*:|\bK:)\s*([\d.]+(?:,\d+)?)/i); return m ? parseFloat(m[1].replace(/\./g, '').replace(',', '.')) || 0 : 0; }
+
+// ---------- ÖDEME KANALLARI / ELLE ÖDEME ----------
+// Elle girilen ödeme/gelir/gider "manual" hareket olarak saklanır. Kanal, hesap adında (acc) durur:
+// Nakit → "Kasa", diğerleri → "Elle · <kanal>". Fatura/vade bağlantısı file alanında: "odeme;inv=<ettn>;plan=<id>".
+const BANKS = [['ziraat', 'Ziraat'], ['garanti', 'Garanti'], ['ykb', 'Yapı Kredi']];
+const CH = {
+  eft_ziraat: { l: 'EFT/Havale – Ziraat', bank: 'Ziraat', src: 'bank' },
+  eft_garanti: { l: 'EFT/Havale – Garanti', bank: 'Garanti', src: 'bank' },
+  eft_ykb: { l: 'EFT/Havale – Yapı Kredi', bank: 'YKB', src: 'bank' },
+  nakit: { l: 'Nakit' },
+  kk_ziraat: { l: 'Ziraat Bankası Kredi Kartı', bank: 'Ziraat', src: 'card' },
+  kk_garanti: { l: 'Garanti Bankası Kredi Kartı', bank: 'Garanti', src: 'card' },
+  kk_ykb: { l: 'Yapı Kredi Kredi Kartı', bank: 'YKB', src: 'card' }
+};
+const MAN_PFX = 'Elle · ';
+const chAcc = c => c === 'nakit' ? KASA_ACC : MAN_PFX + CH[c].l;
+const accCh = acc => acc === KASA_ACC ? 'nakit' : (Object.keys(CH).find(c => MAN_PFX + CH[c].l === acc) || null);
+const chLabel = acc => { const c = accCh(acc); return c ? CH[c].l : acc; };
+const fileTag = (f, k) => { const m = new RegExp('(?:^|;)' + k + '=([^;]+)').exec(f || ''); return m ? m[1] : null; };
+// kanal seçici: ilk liste (EFT/Havale, Nakit, kartlar), EFT seçilince ikinci liste banka
+function chPicker(id, kind) {
+  const top = kind === 'gelir' ? [['eft', 'EFT / Havale'], ['nakit', 'Nakit']] : [['eft', 'EFT / Havale'], ['nakit', 'Nakit'], ['kk_ziraat', CH.kk_ziraat.l], ['kk_garanti', CH.kk_garanti.l], ['kk_ykb', CH.kk_ykb.l]];
+  return `<select id="${id}" style="padding:7px">${top.map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select><select id="${id}b" style="padding:7px">${BANKS.map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select>`;
+}
+function chWire(id) { const f = () => { $('#' + id + 'b').style.display = $('#' + id).value === 'eft' ? '' : 'none'; }; $('#' + id).onchange = f; f(); }
+const chRead = id => { const v = $('#' + id).value; return v === 'eft' ? 'eft_' + $('#' + id + 'b').value : v; };
+function addManualTx(o) {
+  const k = 'elle|' + o.date + '|' + Date.now() + Math.random().toString(36).slice(2, 6);
+  const file = o.file || ['odeme', o.inv ? 'inv=' + o.inv : '', o.plan ? 'plan=' + o.plan : ''].filter(Boolean).join(';');
+  S.tx.push({ k, src: 'manual', acc: chAcc(o.ch), date: o.date, desc: o.desc, sector: '', amt: r2(o.amt), file, cat: o.cat, party: o.party || null, man: true, eff: null });
+  IDX.tx.add(k); mark('tx', k); return k;
+}
+function delManualTx(k) { const t = S.tx.find(x => x.k === k); if (!t || t.src !== 'manual') return false; S.tx = S.tx.filter(x => x.k !== k); IDX.tx.delete(k); PEND.tx.delete(k); mark('txDel', k); return true; }
+// Elle girilen banka/kart kaydı, sonra yüklenen ekstrede de görünürse iki kez sayılmasın:
+// aynı banka + aynı tür (hesap/kart), tutar ±1 ₺, tarih ±7 gün → elle kayıt "dup" olur (sayılmaz),
+// ekstre satırı elle kaydın cari/kategorisini ve fatura bağlantısını alır.
+function linkManual() {
+  for (const t of S.tx) { t.dup = null; t.linkInv = null; t.viaMan = null; }
+  const used = new Set();
+  const mans = S.tx.filter(t => t.src === 'manual' && t.acc.startsWith(MAN_PFX)).sort((a, b) => a.date.localeCompare(b.date));
+  const loose = new Set(['Faturasız gider', 'Sınıflanmamış', 'Diğer gelir']);
+  for (const m of mans) {
+    const c = CH[accCh(m.acc)]; if (!c || !c.bank) continue;
+    let best = null, bs = 1e9;
+    for (const s of S.tx) {
+      if (s.src !== c.src || !s.acc.startsWith(c.bank + ' ') || used.has(s.k)) continue;
+      const sa = txAmt(s); if (Math.sign(sa) !== Math.sign(m.amt) || Math.abs(Math.abs(sa) - Math.abs(m.amt)) > 1) continue;
+      const dd = Math.abs(daysBetween(m.date, s.date)); if (dd > 7) continue;
+      if (m.party) { if (s.party ? s.party !== m.party : !loose.has(s.cat)) continue; }
+      else if (s.cat !== m.cat && !loose.has(s.cat)) continue;
+      const sc = dd + (m.party && s.party === m.party ? 0 : 3);
+      if (sc < bs) { bs = sc; best = s; }
+    }
+    if (!best) continue;
+    used.add(best.k); m.dup = best.k; best.viaMan = m.k;
+    if (!best.man) { best.cat = m.cat; best.party = m.party; }
+    const iv = fileTag(m.file, 'inv'); if (iv) best.linkInv = iv;
+  }
+}
+// ---------- fatura bazında ödeme durumu ve gerçekleşen vade ----------
+// Faturaya bağlanan ödeme önce o faturayı kapatır; kalanı ve bağlanmamış ödemeler en eski açık faturadan başlayarak (FIFO) dağıtılır.
+let ALLOC = null;
+const termOf = key => { const t = S.meta && S.meta.terms && S.meta.terms[key]; if (t != null && t !== '') return Number(t); const p = S.parties[key]; return p && p.term != null ? p.term : null; };
+function allocAll() {
+  if (ALLOC) return ALLOC;
+  const pays = new Map(), invs = new Map();
+  for (const t of S.tx) if (t.party && t.cat === 'Tedarikçi ödemesi' && !t.dup) { if (!pays.has(t.party)) pays.set(t.party, []); pays.get(t.party).push(t); }
+  for (const i of S.invoices) { if (!invs.has(i.vkn)) invs.set(i.vkn, []); invs.get(i.vkn).push(i); }
+  ALLOC = new Map();
+  for (const key of new Set([...pays.keys(), ...invs.keys()])) ALLOC.set(key, allocParty(key, invs.get(key) || [], pays.get(key) || []));
+  return ALLOC;
+}
+function allocParty(key, invs, pays) {
+  const p = S.parties[key]; const items = [], st = new Map();
+  if (p && p.devir > 0) items.push({ ettn: null, d: '0000-00-00', amt: p.devir, rem: p.devir, pays: [] });
+  for (const i of [...invs].sort((a, b) => a.date.localeCompare(b.date))) if (i.pay > 0) { const it = { ettn: i.ettn, d: i.date, amt: i.pay, rem: i.pay, paidDate: '', pays: [] }; items.push(it); st.set(i.ettn, it); }
+  const ev = pays.map(t => ({ d: t.date, a: -txAmt(t), inv: fileTag(t.file, 'inv') || t.linkInv, t }));
+  for (const i of invs) if (i.pay < 0) ev.push({ d: i.date, a: -i.pay, inv: null, t: null });
+  if (p && p.devir < 0) ev.push({ d: '0000-00-00', a: -p.devir, inv: null, t: null });
+  ev.sort((a, b) => a.d.localeCompare(b.d));
+  const apply = (it, a, e) => { const x = Math.min(it.rem, a); it.rem = r2(it.rem - x); if (e.t) it.pays.push({ t: e.t, a: x }); if (it.rem <= 0.5 && !it.paidDate) it.paidDate = e.d < it.d ? it.d : e.d; return a - x; };
+  for (const e of ev) {
+    let a = e.a; if (a <= 0) continue;
+    if (e.inv && st.has(e.inv)) a = apply(st.get(e.inv), a, e);
+    for (const it of items) { if (a <= 0.005) break; if (it.rem > 0.005) a = apply(it, a, e); }
+  }
+  const paid = items.filter(it => it.ettn && it.paidDate); const w = sum(paid, it => it.amt);
+  const realDays = w ? sum(paid, it => it.amt * Math.max(0, daysBetween(it.d, it.paidDate))) / w : null;
+  return { st, realDays, nPaid: paid.length, open: sum(items, it => it.rem) };
+}
+const invStat = i => { const a = allocAll().get(i.vkn); return a && a.st.get(i.ettn) || null; };
+function payTag(i) {
+  if (i.pay <= 0) return '';
+  const s = invStat(i); if (!s) return '<span class="tag w">açık</span>';
+  if (s.rem <= 0.5) return `<span class="tag" style="background:#e3f4e8;color:var(--pos)" title="${esc(s.pays.map(x => dTR(x.t.date) + ' ' + chLabel(x.t.acc) + ' ' + fmt(x.a)).join('\n'))}">ödendi ${dTR(s.paidDate)}</span>`;
+  if (s.rem < s.amt - 0.5) return `<span class="tag w">kısmi · kalan ${fmt(s.rem)}</span>`;
+  const due = i.due && /^\d{4}-\d{2}-\d{2}$/.test(i.due) ? i.due : (termOf(i.vkn) != null ? addDays(i.date, termOf(i.vkn)) : '');
+  return due && due < todayISO() ? `<span class="tag w" style="background:#fde8e6;color:var(--neg)">açık · vade ${dTR(due)}</span>` : `<span class="tag w">açık${due ? ' · vade ' + dTR(due) : ''}</span>`;
+}
 
 // ---------- başlangıç ----------
 // başlangıç verisini mevcut veriye ekler (mükerrerleri atlar)
@@ -569,9 +670,9 @@ function buildWarnings(y) {
   const w = [];
   const dd = dueSummary();
   if (dd.over.length || dd.soon.length) w.push(`<b>Vade:</b> ${dd.over.length} ödemenin vadesi geçmiş (${fmt(sum(dd.over, p => p.amount))} ₺), ${dd.soon.length} ödeme 3 gün içinde (${fmt(sum(dd.soon, p => p.amount))} ₺). <a href="#vadeler">Vadeler</a>`);
-  const unc = S.tx.filter(t => t.date.startsWith(y) && t.cat === 'Sınıflanmamış');
+  const unc = S.tx.filter(t => t.date.startsWith(y) && t.cat === 'Sınıflanmamış' && !t.dup);
   if (unc.length) w.push(`<b>${unc.length}</b> banka çıkışı sınıflanmamış (${fmt(-sum(unc, txAmt))} ₺). <a href="#banka" onclick="BF.cat='Sınıflanmamış'">Banka & Kart</a> sekmesinden kategorisini seçin.`);
-  const noInv = Object.values(S.parties).filter(p => !IDX.partyHasInv.has(p.key)).map(p => ({ p, a: -sum(S.tx.filter(t => t.party === p.key && t.cat === 'Tedarikçi ödemesi' && t.date.startsWith(y)), txAmt) })).filter(x => x.a > 0);
+  const noInv = Object.values(S.parties).filter(p => !IDX.partyHasInv.has(p.key)).map(p => ({ p, a: -sum(S.tx.filter(t => t.party === p.key && t.cat === 'Tedarikçi ödemesi' && !t.dup && t.date.startsWith(y)), txAmt) })).filter(x => x.a > 0);
   if (noInv.length) w.push(`E-faturası olmayan ödemeler: ${noInv.map(x => `${esc(x.p.name)} (${fmt0(x.a)} ₺)`).join(', ')}. Fatura isteyin / muhasebeye iletin.`);
   const sus = groupBy(S.invoices.filter(i => i.date.startsWith(y)), i => i.vkn + '|' + i.date + '|' + i.total).filter(([, a]) => a.length > 1).filter(([, a]) => { const l = a.map(i => S.lines.filter(x => x.ettn === i.ettn).map(x => x.name + x.qty).sort().join(';')); return l.every(s => s === l[0]); });
   if (sus.length) w.push('Şüpheli mükerrer fatura (aynı gün, aynı tedarikçi, aynı tutar ve ürünler): ' + sus.map(([, a]) => esc(pName(a[0].vkn)) + ' ' + a.map(i => i.no).join(' / ') + ' ' + fmt(a[0].total) + ' ₺').join('; '));
@@ -586,7 +687,7 @@ function vFaturalar() {
   const y = YEAR(); const invY = S.invoices.filter(i => i.date.startsWith(y));
   const months = monthsWithData(invY, i => i.date);
   const rows = groupBy(invY, i => i.vkn).map(([k, a]) => { const m = Array(12).fill(0); a.forEach(i => m[mIdx(i.date)] += invAmt(i)); return { k, name: pName(k), m, t: sum(m), n: a.length }; }).sort((a, b) => b.t - a.t);
-  $('#view').innerHTML = `<div class="card"><div class="tools"><input type="search" id="q" placeholder="Tedarikçi ara…" value="${esc(FF.q)}"><span class="mut">Satıra tıklayın: ay ay faturalar ve ürünler. Tutarlar ${KDV() ? 'KDV dahil' : 'KDV hariç'}.</span><span style="flex:1"></span><button class="btn sec" onclick="exportPivot()">Excel'e aktar</button></div>
+  $('#view').innerHTML = `<div class="card"><div class="tools"><input type="search" id="q" placeholder="Tedarikçi ara…" value="${esc(FF.q)}"><span class="mut">Satıra tıklayın: ay ay faturalar, ödeme durumu ve ürünler. Tutarlar ${KDV() ? 'KDV dahil' : 'KDV hariç'}.</span><span style="flex:1"></span><button class="btn sec" onclick="openInvoices()">Ödenmemiş faturalar</button><button class="btn" onclick="payForm({after:vFaturalar})">+ Ödeme gir</button><button class="btn sec" onclick="exportPivot()">Excel'e aktar</button></div>
   <div class="tw"><table id="pv"></table></div></div>`;
   const draw = () => {
     const q = norm(FF.q); const rs = rows.filter(r => !q || norm(r.name).includes(q) || r.k.includes(q));
@@ -603,12 +704,93 @@ function supDetail(vkn) {
   const inv = S.invoices.filter(i => i.vkn === vkn && i.date.startsWith(y)).sort((a, b) => a.date.localeCompare(b.date));
   const byM = groupBy(inv, i => mIdx(i.date));
   const prods = aggProducts(S.lines.filter(l => l.vkn === vkn && l.date.startsWith(y)));
+  const al = allocAll().get(vkn); const term = termOf(vkn);
+  const mans = S.tx.filter(t => t.src === 'manual' && t.party === vkn && t.cat === 'Tedarikçi ödemesi').sort((a, b) => b.date.localeCompare(a.date));
+  const ro = canWrite() ? '' : 'disabled';
   openModal(`<h3>${esc(p.name)}</h3><div class="mut" style="margin-bottom:10px">VKN/TCKN: ${esc(vkn)} · Kategori: ${esc(p.cat || '')} · ${y}</div>${contactLine(S.parties[vkn])}
-  <div class="tw" style="max-height:340px"><table><tr><th>Ay</th><th>Fatura No</th><th>Tarih</th><th class="n">Matrah</th><th class="n">KDV</th><th class="n">Toplam</th></tr>
-  ${byM.map(([m, a]) => a.map(i => `<tr><td>${AY[m]}</td><td>${esc(i.no)}${i.src === 'PDF' ? ' <span class="tag w">PDF</span>' : ''}${i.type === 'IADE' ? ' <span class="tag w">İADE</span>' : ''}</td><td>${dTR(i.date)}</td><td class="n">${fmt(i.net)}</td><td class="n">${fmt(i.vat)}</td><td class="n">${fmt(i.total)}</td></tr>`).join('') +
-    `<tr class="sub"><td>${AY[m]} toplamı</td><td>${a.length} fatura</td><td></td><td class="n">${fmt(sum(a, i => i.net))}</td><td class="n">${fmt(sum(a, i => i.vat))}</td><td class="n">${fmt(sum(a, i => i.total))}</td></tr>`).join('')}
-  <tr class="tot"><td>${y} TOPLAM</td><td>${inv.length} fatura</td><td></td><td class="n">${fmt(sum(inv, i => i.net))}</td><td class="n">${fmt(sum(inv, i => i.vat))}</td><td class="n">${fmt(sum(inv, i => i.total))}</td></tr></table></div>
+  <div class="tools" style="margin-bottom:8px"><span>Anlaşılan vade: <b>${term != null ? term + ' gün' : '—'}</b></span><span>· Gerçekleşen ort.: <b>${al && al.realDays != null ? fmt0(al.realDays) + ' gün' : '—'}</b></span><span>· Açık bakiye: <b>${al ? fmt(al.open) : '0,00'} ₺</b></span><span style="flex:1"></span><button class="btn" ${ro} onclick="payForm({vkn:'${esc(vkn)}',after:()=>supDetail('${esc(vkn)}')})">+ Ödeme gir</button></div>
+  <div class="tw" style="max-height:340px"><table><tr><th>Ay</th><th>Fatura No</th><th>Tarih</th><th class="n">Matrah</th><th class="n">KDV</th><th class="n">Toplam</th><th>Ödeme durumu</th><th></th></tr>
+  ${byM.map(([m, a]) => a.map(i => { const s = invStat(i); return `<tr><td>${AY[m]}</td><td>${esc(i.no)}${i.src === 'PDF' ? ' <span class="tag w">PDF</span>' : ''}${i.type === 'IADE' ? ' <span class="tag w">İADE</span>' : ''}</td><td>${dTR(i.date)}</td><td class="n">${fmt(i.net)}</td><td class="n">${fmt(i.vat)}</td><td class="n">${fmt(i.total)}</td><td>${payTag(i)}</td>
+    <td>${s && s.rem > 0.5 ? `<button class="btn sec" style="padding:2px 8px" ${ro} onclick="payForm({vkn:'${esc(vkn)}',ettn:'${esc(i.ettn)}',after:()=>supDetail('${esc(vkn)}')})">Öde</button>` : ''}</td></tr>`; }).join('') +
+    `<tr class="sub"><td>${AY[m]} toplamı</td><td>${a.length} fatura</td><td></td><td class="n">${fmt(sum(a, i => i.net))}</td><td class="n">${fmt(sum(a, i => i.vat))}</td><td class="n">${fmt(sum(a, i => i.total))}</td><td></td><td></td></tr>`).join('')}
+  <tr class="tot"><td>${y} TOPLAM</td><td>${inv.length} fatura</td><td></td><td class="n">${fmt(sum(inv, i => i.net))}</td><td class="n">${fmt(sum(inv, i => i.vat))}</td><td class="n">${fmt(sum(inv, i => i.total))}</td><td></td><td></td></tr></table></div>
+  <div class="mut" style="margin-top:4px">Ödeme durumu: faturaya bağlanan ödeme önce o faturayı kapatır; banka/kart ödemeleri ve bağlanmamış ödemeler en eski açık faturadan başlayarak dağıtılır. Üzerine gelince ödemeleri gösterir.</div>
+  ${mans.length ? `<h3 style="margin-top:16px">Elle girilen ödemeler</h3><div class="tw" style="max-height:220px"><table><tr><th>Tarih</th><th>Kanal</th><th>Fatura</th><th>Açıklama</th><th class="n">Tutar</th><th>Ekstre</th><th></th></tr>
+  ${mans.map(t => { const iv = fileTag(t.file, 'inv'); const ii = iv ? IDX.inv.get(iv.toLowerCase()) : null; const d = t.dup ? S.tx.find(x => x.k === t.dup) : null;
+    return `<tr><td>${dTR(t.date)}</td><td>${esc(chLabel(t.acc))}</td><td>${ii ? esc(ii.no) : '<span class="mut">genel</span>'}</td><td>${esc(t.desc)}</td><td class="n">${fmt(-t.amt)}</td><td>${d ? `<span class="tag" title="${esc(d.acc + ' – ' + d.desc)}">ekstrede var ${dTR(d.date)} (bir kez sayıldı)</span>` : CH[accCh(t.acc)] && CH[accCh(t.acc)].bank ? '<span class="mut">ekstre bekleniyor</span>' : ''}</td><td><button class="btn red" style="padding:2px 8px" ${ro} onclick="paySil('${esc(t.k)}',()=>supDetail('${esc(vkn)}'))">Sil</button></td></tr>`; }).join('')}</table></div>` : ''}
   <h3 style="margin-top:16px">Bu tedarikçiden alınan ürünler</h3>${prodTable(prods, false)}`);
+}
+// ---------- elle ödeme girişi (faturalar, tedarikçi, vadeler) ----------
+function payForm(o) {
+  o = o || {}; if (!guard()) return;
+  const pl = o.plan ? (S.planned || []).find(x => x.id === o.plan) : null;
+  const names = Object.values(S.parties).map(p => p.name).sort((a, b) => a.localeCompare(b, TR));
+  const bm = pl ? planMatch(pl) : null;
+  openModal(`<h3>Ödeme gir${pl ? ' – vade ' + dTR(pl.due) : ''}</h3>
+  ${bm ? `<div class="warn">Bankada/kartta uygun bir ödeme var: <b>${dTR(bm.date)} · ${esc(bm.acc)} · ${fmt(-txAmt(bm))} ₺</b><br><span class="mut">${esc(bm.desc)}</span><br><button class="btn" style="margin-top:6px" id="ybm">Bu ödemeyle eşle (yeni kayıt girmeden "ödendi" yap)</button></div>` : ''}
+  <div class="tools" style="flex-direction:column;align-items:stretch;max-width:480px">
+    <label class="mut">Tedarikçi / cari</label><input type="text" id="yp" list="plistY" value="${o.vkn ? esc(pName(o.vkn)) : pl && pl.party ? esc(pName(pl.party)) : ''}" ${o.vkn ? 'readonly' : ''} placeholder="Tedarikçi adı" style="padding:7px">
+    <label class="mut">Fatura</label><select id="yi" style="padding:7px"></select>
+    <label class="mut">Tutar (₺)</label><input type="text" id="ya" style="padding:7px" value="${o.amount ? fmt(o.amount) : pl ? fmt(pl.amount) : ''}">
+    <label class="mut">Ödeme tarihi</label><input type="text" id="yd" value="${dTR(todayISO())}" placeholder="GG.AA.YYYY" style="padding:7px">
+    <label class="mut">Ödeme kanalı</label><div class="tools" style="margin:0">${chPicker('yc', 'odeme')}</div>
+    <label class="mut">Açıklama (isteğe bağlı)</label><input type="text" id="yn" style="padding:7px" value="${pl ? esc(pl.descr || '') : ''}">
+    <button class="btn" id="ys">Kaydet</button>
+    <div class="mut">EFT/Havale ve kredi kartı ödemeleri, o bankanın ekstresi yüklendiğinde otomatik eşleşir (aynı tutar ±1 ₺, ±7 gün) ve iki kez sayılmaz. Nakit ödeme Kasa'dan düşer.</div>
+  </div><datalist id="plistY">${names.map(n => `<option value="${esc(n)}">`).join('')}</datalist>`);
+  chWire('yc');
+  const partyKey = () => { const n = $('#yp').value.trim(); if (!n) return null; const p = Object.values(S.parties).find(p => up(p.name) === up(n)); return p ? p.key : null; };
+  const fillInv = () => {
+    const key = partyKey(); const al = key ? allocAll().get(key) : null;
+    const open = key ? S.invoices.filter(i => i.vkn === key && i.pay > 0).map(i => ({ i, s: invStat(i) })).filter(x => x.s && x.s.rem > 0.5).sort((a, b) => a.i.date.localeCompare(b.i.date)) : [];
+    const want = o.ettn || (pl && pl.invoice_no && key ? (S.invoices.find(i => i.no === pl.invoice_no && i.vkn === key) || {}).ettn : '');
+    $('#yi').innerHTML = `<option value="">Faturaya bağlamadan (genel ödeme${al ? ', açık bakiye ' + fmt(al.open) + ' ₺' : ''})</option>` + open.map(x => `<option value="${esc(x.i.ettn)}" ${x.i.ettn === want ? 'selected' : ''}>${esc(x.i.no)} · ${dTR(x.i.date)} · kalan ${fmt(x.s.rem)} ₺</option>`).join('');
+    if (want && !open.some(x => x.i.ettn === want)) { const ii = IDX.inv.get(String(want).toLowerCase()); if (ii) $('#yi').insertAdjacentHTML('beforeend', `<option value="${esc(ii.ettn)}" selected>${esc(ii.no)} · ${dTR(ii.date)} (ödenmiş görünüyor)</option>`); }
+    setAmt();
+  };
+  const setAmt = () => { const e = $('#yi').value; if (!e || o.amount || pl) return; const ii = IDX.inv.get(e.toLowerCase()); const s = ii && invStat(ii); if (s) $('#ya').value = fmt(s.rem); };
+  $('#yp').onchange = fillInv; $('#yi').onchange = setAmt; fillInv();
+  if (bm) $('#ybm').onclick = () => { planDone(pl, bm.k); save(); closeModal(); (o.after || vVadeler)(); toast('Banka ödemesiyle eşlendi, ödendi yapıldı'); };
+  $('#ys').onclick = () => {
+    if (!guard()) return;
+    const a = parseTR($('#ya').value); const m = $('#yd').value.trim().match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
+    if (isNaN(a) || a <= 0 || !m) return toast('Tutar ve ödeme tarihi (GG.AA.YYYY) gerekli', true);
+    const iso = `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
+    const pn = $('#yp').value.trim(); let key = partyKey();
+    if (!key && pn) key = ensureParty('X:' + pn, pn, '').key;
+    if (!key && !pl) return toast('Tedarikçi adını yazın', true);
+    const ch = chRead('yc'); const inv = $('#yi').value || null;
+    // aynı ödeme bankada zaten görünüyor mu?
+    if (key && CH[ch].bank) {
+      const same = S.tx.find(t => t.party === key && t.cat === 'Tedarikçi ödemesi' && t.src !== 'manual' && !t.viaMan && Math.abs(-txAmt(t) - a) <= 1 && Math.abs(daysBetween(iso, t.date)) <= 10);
+      if (same && !confirm(`Bu tedarikçiye ${dTR(same.date)} tarihinde ${fmt(-txAmt(same))} ₺ ödeme ekstrede zaten görünüyor (${same.acc}).\nYine de ayrı bir ödeme olarak girilsin mi?`)) return;
+    }
+    const ii = inv ? IDX.inv.get(inv.toLowerCase()) : null;
+    const desc = $('#yn').value.trim() || ('Ödeme' + (ii ? ' – fatura ' + ii.no : '') + ' (' + CH[ch].l + ')');
+    const k = addManualTx({ date: iso, amt: -a, ch, cat: key ? 'Tedarikçi ödemesi' : 'Faturasız gider', party: key, desc, inv, plan: pl ? pl.id : null });
+    if (pl) planDone(pl, k);
+    reclassifyAll(); save(); initYears(); closeModal(); toast(`Ödeme kaydedildi: ${fmt(a)} ₺ · ${CH[ch].l}`);
+    if (o.after) o.after(); else go(CUR);
+  };
+}
+function paySil(k, after) {
+  if (!guard()) return; const t = S.tx.find(x => x.k === k); if (!t || t.src !== 'manual') return;
+  if (!confirm(`${dTR(t.date)} · ${chLabel(t.acc)} · ${fmt(Math.abs(t.amt))} ₺ silinsin mi?`)) return;
+  const pid = fileTag(t.file, 'plan'); const pl = pid && (S.planned || []).find(x => x.id === pid);
+  if (pl && pl.status === 'tamamlandi') { pl.status = 'bekliyor'; mark('plan', pl.id); }
+  delManualTx(k); reclassifyAll(); save(); toast('Silindi' + (pl ? '; vade tekrar "bekliyor"' : ''));
+  if (after) after(); else go(CUR);
+}
+function openInvoices() {
+  const al = allocAll(); const rows = [];
+  for (const i of S.invoices) { if (i.pay <= 0) continue; const s = al.get(i.vkn) && al.get(i.vkn).st.get(i.ettn); if (s && s.rem > 0.5) rows.push({ i, s }); }
+  rows.sort((a, b) => a.i.date.localeCompare(b.i.date));
+  const ro = canWrite() ? '' : 'disabled';
+  openModal(`<h3>Ödenmemiş faturalar (${rows.length} · ${fmt(sum(rows, r => r.s.rem))} ₺)</h3>
+  <div class="mut" style="margin-bottom:8px">Banka/kart ödemeleri en eski faturadan başlayarak düşüldükten sonra kalanlar. 2026 öncesi borç Cari sekmesindeki <b>Devir</b> ile girilir.</div>
+  <div class="tw" style="max-height:65vh"><table><tr><th>Tarih</th><th>Tedarikçi</th><th>Fatura</th><th class="n">Tutar</th><th class="n">Kalan</th><th>Durum</th><th></th></tr>
+  ${rows.map(r => `<tr><td>${dTR(r.i.date)}</td><td><a href="javascript:void 0" onclick="supDetail('${esc(r.i.vkn)}')">${esc(pName(r.i.vkn))}</a></td><td>${esc(r.i.no)}</td><td class="n">${fmt(r.i.pay)}</td><td class="n"><b>${fmt(r.s.rem)}</b></td><td>${payTag(r.i)}</td><td><button class="btn sec" style="padding:2px 8px" ${ro} onclick="payForm({vkn:'${esc(r.i.vkn)}',ettn:'${esc(r.i.ettn)}',after:openInvoices})">Öde</button></td></tr>`).join('')}
+  </table></div>`);
 }
 
 // ---------- ÜRÜNLER ----------
@@ -657,10 +839,10 @@ function computeCari() {
   const res = [];
   for (const p of Object.values(S.parties)) {
     const inv = S.invoices.filter(i => i.vkn === p.key);
-    const pay = S.tx.filter(t => t.party === p.key && t.cat === 'Tedarikçi ödemesi');
+    const pay = S.tx.filter(t => t.party === p.key && t.cat === 'Tedarikçi ödemesi' && !t.dup);
     if (!inv.length && !pay.length && !p.devir) continue;
-    const f = sum(inv, i => i.pay), o = -sum(pay, txAmt);
-    res.push({ p, f, o, bal: (p.devir || 0) + f - o, lastI: inv.reduce((m, i) => i.date > m ? i.date : m, ''), lastP: pay.reduce((m, t) => t.date > m ? t.date : m, ''), nI: inv.length, nP: pay.length });
+    const f = sum(inv, i => i.pay), o = -sum(pay, txAmt); const al = allocAll().get(p.key);
+    res.push({ p, f, o, bal: (p.devir || 0) + f - o, term: termOf(p.key), real: al ? al.realDays : null, nPaid: al ? al.nPaid : 0, lastI: inv.reduce((m, i) => i.date > m ? i.date : m, ''), lastP: pay.reduce((m, t) => t.date > m ? t.date : m, ''), nI: inv.length, nP: pay.length });
   }
   return res;
 }
@@ -669,26 +851,34 @@ function vCari() {
   const rows = computeCari();
   $('#view').innerHTML = `<div class="card"><div class="tools"><input type="search" id="q" placeholder="Cari ara…" value="${esc(CF.q)}">
   <select id="only"><option value="all">Hepsi</option><option value="borc">Borcumuz olanlar</option><option value="eksi">Fazla ödenen / faturası eksik</option><option value="odenen">Ödemesi olanlar</option></select>
-  <select id="srt"><option value="bal">Bakiyeye göre</option><option value="name">Ada göre</option><option value="f">Fatura toplamına göre</option></select>
+  <select id="srt"><option value="bal">Bakiyeye göre</option><option value="name">Ada göre</option><option value="f">Fatura toplamına göre</option><option value="real">Gerçekleşen vadeye göre</option></select>
   <span style="flex:1"></span><button class="btn sec" id="ex">Excel'e aktar</button></div>
-  <div class="mut" style="margin-bottom:8px">Bakiye = Devir + Faturalar − Ödemeler (pozitif: tedarikçiye borcumuz var). Sarı <b>Devir</b> kutusuna 2026 öncesi bakiyeyi yazabilirsiniz. Kategori gelir-gider raporunda kullanılır. İsme tıklayın: hesap ekstresi.</div>
+  <div class="mut" style="margin-bottom:8px">Bakiye = Devir + Faturalar − Ödemeler (pozitif: tedarikçiye borcumuz var). Sarı <b>Devir</b> kutusuna 2026 öncesi bakiyeyi yazabilirsiniz. <b>Vade (anlaşılan)</b>: tedarikçiyle anlaştığınız gün; <b>Gerçekleşen vade</b>: faturayı ortalama kaç günde ödediğiniz (kırmızı: anlaşmadan geç, yeşil: erken). Kategori gelir-gider raporunda kullanılır. İsme tıklayın: hesap ekstresi.</div>
   <div class="tw"><table id="ct"></table></div></div>`;
   $('#only').value = CF.only; $('#srt').value = CF.sort;
-  const filt = () => { const q = norm(CF.q); let rs = rows.filter(r => (!q || norm(r.p.name).includes(q) || r.p.key.includes(q)) && (CF.only === 'all' || (CF.only === 'borc' && r.bal > 0.5) || (CF.only === 'eksi' && r.bal < -0.5) || (CF.only === 'odenen' && r.nP))); rs.sort(CF.sort === 'name' ? (a, b) => a.p.name.localeCompare(b.p.name, TR) : CF.sort === 'f' ? (a, b) => b.f - a.f : (a, b) => b.bal - a.bal); return rs; };
+  const filt = () => { const q = norm(CF.q); let rs = rows.filter(r => (!q || norm(r.p.name).includes(q) || r.p.key.includes(q)) && (CF.only === 'all' || (CF.only === 'borc' && r.bal > 0.5) || (CF.only === 'eksi' && r.bal < -0.5) || (CF.only === 'odenen' && r.nP))); rs.sort(CF.sort === 'name' ? (a, b) => a.p.name.localeCompare(b.p.name, TR) : CF.sort === 'f' ? (a, b) => b.f - a.f : CF.sort === 'real' ? (a, b) => (b.real ?? -1) - (a.real ?? -1) : (a, b) => b.bal - a.bal); return rs; };
   const draw = () => {
     const rs = filt();
-    $('#ct').innerHTML = `<tr><th>Cari</th><th>Telefon</th><th>Kategori</th><th class="n">Devir</th><th class="n">Faturalar</th><th class="n">Ödemeler</th><th class="n">Bakiye</th><th>Son fatura</th><th>Son ödeme</th></tr>` +
+    $('#ct').innerHTML = `<tr><th>Cari</th><th>Telefon</th><th>Kategori</th><th class="n" title="Tedarikçiyle anlaştığınız ödeme vadesi (gün). Yazıp Enter'a basın.">Vade (anlaşılan)</th><th class="n" title="Faturanın kesildiği günden tamamen ödendiği güne kadar geçen ortalama gün (tutara göre ağırlıklı)">Gerçekleşen vade</th><th class="n">Devir</th><th class="n">Faturalar</th><th class="n">Ödemeler</th><th class="n">Bakiye</th><th>Son fatura</th><th>Son ödeme</th></tr>` +
       rs.map(r => `<tr><td><a href="javascript:void 0" onclick="cariEkstre('${esc(r.p.key)}')">${esc(r.p.name)}</a>${r.nI ? '' : ' <span class="tag w">e-fatura yok</span>'}</td>
       <td style="white-space:nowrap">${r.p.phone ? `<a href="tel:${esc(String(r.p.phone).replace(/[^\d+]/g, ''))}">${esc(r.p.phone)}</a>` : ''}</td>
       <td><select data-k="${esc(r.p.key)}" class="cat">${SUP_CATS.map(c => `<option ${c === r.p.cat ? 'selected' : ''}>${c}</option>`).join('')}</select></td>
+      <td class="n"><input class="vd" data-k="${esc(r.p.key)}" value="${r.term != null ? r.term : ''}" placeholder="gün" style="width:56px;text-align:right"></td>
+      <td class="n" title="${r.nPaid} ödenmiş faturaya göre">${r.real != null ? `<span class="${r.term != null && r.real > r.term + 3 ? 'neg' : r.term != null && r.real < r.term - 3 ? 'pos' : ''}">${fmt0(r.real)} gün</span>` : '<span class="mut">—</span>'}</td>
       <td class="n"><input class="dv" data-k="${esc(r.p.key)}" value="${r.p.devir ? fmt(r.p.devir) : ''}" placeholder="0,00"></td>
       <td class="n">${fmt(r.f)}</td><td class="n">${fmt(r.o)}</td><td class="n ${r.bal > 0.5 ? 'neg' : r.bal < -0.5 ? 'pos' : ''}"><b>${fmt(r.bal)}</b></td><td>${dTR(r.lastI)}</td><td>${dTR(r.lastP)}</td></tr>`).join('') +
-      `<tr class="tot"><td>TOPLAM (${rs.length})</td><td></td><td></td><td class="n">${fmt(sum(rs, r => r.p.devir || 0))}</td><td class="n">${fmt(sum(rs, r => r.f))}</td><td class="n">${fmt(sum(rs, r => r.o))}</td><td class="n">${fmt(sum(rs, r => r.bal))}</td><td></td><td></td></tr>`;
+      `<tr class="tot"><td>TOPLAM (${rs.length})</td><td></td><td></td><td></td><td></td><td class="n">${fmt(sum(rs, r => r.p.devir || 0))}</td><td class="n">${fmt(sum(rs, r => r.f))}</td><td class="n">${fmt(sum(rs, r => r.o))}</td><td class="n">${fmt(sum(rs, r => r.bal))}</td><td></td><td></td></tr>`;
     $('#ct').querySelectorAll('select.cat').forEach(s => s.onchange = () => { if (!guard()) return vCari(); S.parties[s.dataset.k].cat = s.value; S.parties[s.dataset.k].catSet = true; mark('par', s.dataset.k); save(); toast('Kategori kaydedildi'); });
+    $('#ct').querySelectorAll('input.vd').forEach(inp => inp.onchange = () => {
+      if (!guard()) return vCari(); const s = inp.value.trim(); const v = parseInt(s, 10);
+      if (s && (isNaN(v) || v < 0 || v > 365)) return toast('Vade 0–365 gün olmalı', true);
+      S.meta.terms = Object.assign({}, S.meta.terms || {}); if (s) S.meta.terms[inp.dataset.k] = v; else delete S.meta.terms[inp.dataset.k];
+      mark('meta', 'terms'); save(); vCari(); toast(s ? 'Vade kaydedildi: ' + v + ' gün' : 'Vade silindi');
+    });
     $('#ct').querySelectorAll('input.dv').forEach(inp => inp.onchange = () => { if (!guard()) return vCari(); const v = parseTR(inp.value); S.parties[inp.dataset.k].devir = isNaN(v) ? 0 : v; mark('par', inp.dataset.k); save(); vCari(); toast('Devir kaydedildi'); });
   };
   $('#q').oninput = e => { CF.q = e.target.value; draw(); }; $('#only').onchange = e => { CF.only = e.target.value; draw(); }; $('#srt').onchange = e => { CF.sort = e.target.value; draw(); };
-  $('#ex').onclick = () => xlsxDownload('Cari', [['Cari', 'VKN', 'Kategori', 'Devir', 'Faturalar', 'Ödemeler', 'Bakiye', 'Son fatura', 'Son ödeme'], ...filt().map(r => [r.p.name, r.p.vkn, r.p.cat, r.p.devir || 0, r2(r.f), r2(r.o), r2(r.bal), dTR(r.lastI), dTR(r.lastP)])]);
+  $('#ex').onclick = () => xlsxDownload('Cari', [['Cari', 'VKN', 'Kategori', 'Vade (anlaşılan, gün)', 'Gerçekleşen vade (gün)', 'Devir', 'Faturalar', 'Ödemeler', 'Bakiye', 'Son fatura', 'Son ödeme'], ...filt().map(r => [r.p.name, r.p.vkn, r.p.cat, r.term ?? '', r.real != null ? Math.round(r.real) : '', r.p.devir || 0, r2(r.f), r2(r.o), r2(r.bal), dTR(r.lastI), dTR(r.lastP)])]);
   draw();
 }
 // carinin iletişim satırı (telefona dokununca arar, e-postaya dokununca e-posta açar)
@@ -697,12 +887,12 @@ function contactLine(p) {
   const a = [];
   if (p.phone) a.push(`☎ <a href="tel:${esc(String(p.phone).replace(/[^\d+]/g, ''))}">${esc(p.phone)}</a>`);
   if (p.email) a.push(`✉ <a href="mailto:${esc(p.email)}">${esc(p.email)}</a>`);
-  if (p.term != null) a.push(`Ödeme vadesi: ${esc(p.term)} gün`);
+  if (termOf(p.key) != null) a.push(`Ödeme vadesi: ${esc(termOf(p.key))} gün`);
   return a.length ? `<div style="margin:-4px 0 10px">${a.join(' · ')}</div>` : '';
 }
 function cariEkstre(key) {
   const p = S.parties[key];
-  const items = [...S.invoices.filter(i => i.vkn === key).map(i => ({ d: i.date, t: 'Fatura ' + i.no, b: i.pay, a: 0 })), ...S.tx.filter(t => t.party === key && t.cat === 'Tedarikçi ödemesi').map(t => ({ d: t.date, t: t.acc + ' – ' + t.desc, b: 0, a: -txAmt(t) }))].sort((x, y) => x.d.localeCompare(y.d) || (y.b - x.b));
+  const items = [...S.invoices.filter(i => i.vkn === key).map(i => ({ d: i.date, t: 'Fatura ' + i.no, b: i.pay, a: 0 })), ...S.tx.filter(t => t.party === key && t.cat === 'Tedarikçi ödemesi' && !t.dup).map(t => ({ d: t.date, t: (t.src === 'manual' ? chLabel(t.acc) + ' (elle)' : t.acc) + ' – ' + t.desc + (t.viaMan ? ' ✓ elle girilen ödemeyle eşleşti' : ''), b: 0, a: -txAmt(t) }))].sort((x, y) => x.d.localeCompare(y.d) || (y.b - x.b));
   let bal = p.devir || 0;
   openModal(`<h3>${esc(p.name)} – hesap ekstresi</h3>${contactLine(p)}<div class="tw" style="max-height:65vh"><table><tr><th>Tarih</th><th>İşlem</th><th class="n">Borç (fatura)</th><th class="n">Alacak (ödeme)</th><th class="n">Bakiye</th></tr>
   <tr><td></td><td>Devir</td><td></td><td></td><td class="n">${fmt(bal)}</td></tr>
@@ -731,7 +921,7 @@ function vBanka() {
     const ts = filt(); const inn = sum(ts.filter(t => txAmt(t) > 0), txAmt), out = sum(ts.filter(t => txAmt(t) < 0), txAmt);
     $('#cnt').innerHTML = `${ts.length} hareket · Giriş <span class="pos">${fmt(inn)}</span> · Çıkış <span class="neg">${fmt(out)}</span>`;
     $('#bt').innerHTML = `<tr><th>Tarih</th><th>Hesap</th><th>Açıklama</th><th class="n">Tutar</th><th>Kategori</th><th>Cari (tedarikçi)</th></tr>` +
-      ts.slice(0, BF.lim).map(t => `<tr><td>${dTR(t.date)}</td><td class="mut">${esc(t.acc)}</td><td>${esc(t.desc)}${t.sector ? ` <span class="tag">${esc(t.sector)}</span>` : ''}${t.eff != null ? ` <span class="tag w">taksitli: toplam ${fmt(-t.eff)} sayıldı</span>` : ''}${t.man ? ' <span class="tag">elle</span>' : ''}</td>
+      ts.slice(0, BF.lim).map(t => `<tr><td>${dTR(t.date)}</td><td class="mut">${esc(t.acc)}</td><td>${esc(t.desc)}${t.sector ? ` <span class="tag">${esc(t.sector)}</span>` : ''}${t.eff != null ? ` <span class="tag w">taksitli: toplam ${fmt(-t.eff)} sayıldı</span>` : ''}${t.man ? ' <span class="tag">elle</span>' : ''}${t.dup ? ' <span class="tag w">ekstrede de var → sayılmadı</span>' : ''}${t.viaMan ? ' <span class="tag">elle girilen kayıtla eşleşti</span>' : ''}</td>
       <td class="n ${txAmt(t) >= 0 ? 'pos' : 'neg'}">${fmt(t.amt)}</td>
       <td><select data-k="${esc(t.k)}" class="tc">${cats.map(c => `<option ${c === t.cat ? 'selected' : ''}>${c}</option>`).join('')}</select></td>
       <td><input class="party" list="plist" data-k="${esc(t.k)}" value="${esc(t.party ? pName(t.party) : '')}" placeholder="—"></td></tr>`).join('');
@@ -755,7 +945,7 @@ function setTx(k, cat, partyName) {
   }
   if (cat === undefined) cat = t.cat;
   if (cat !== 'Tedarikçi ödemesi') party = null;
-  if (BF.apply) {
+  if (BF.apply && t.src !== 'manual') {
     const kw = norm(t.desc).replace(/\b\d[\d ]*\b/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60);
     if (kw.length >= 4) { S.rules = S.rules.filter(r => r.kw !== kw); S.rules.unshift({ kw, cat, party, at: new Date().toISOString() }); mark('rules', kw); }
     if (t.man) mark('tx', t.k);
@@ -779,8 +969,8 @@ function computeGG(y) {
   const add = (s, cat, d, a, item) => { const map = sec[s]; if (!map.has(cat)) map.set(cat, { cat, m: Array(12).fill(0), items: Array.from({ length: 12 }, () => []) }); const r = map.get(cat); r.m[mIdx(d)] += a; r.items[mIdx(d)].push(item); };
   const pSec = p => (p && YATIRIM_CATS.has(p.cat)) ? 'yatirim' : 'gider';
   for (const t of S.tx) {
-    if (!t.date.startsWith(y)) continue;
-    const kind = TX_CATS[t.cat]; const a = txAmt(t); const w = t.acc + ' – ' + t.desc;
+    if (!t.date.startsWith(y) || t.dup) continue;
+    const kind = TX_CATS[t.cat]; const a = txAmt(t); const w = (t.src === 'manual' ? chLabel(t.acc) + ' (elle)' : t.acc) + ' – ' + t.desc;
     if (kind === 'gelir') {
       const kom = t.cat === 'POS tahsilatı' ? posComm(t) : 0; // net yatan + komisyon = brüt satış; komisyon ayrıca gider
       const salesLike = t.cat === 'POS tahsilatı' || t.cat === 'Nakit yatırma' || t.cat === 'Nakit satış';
@@ -832,9 +1022,47 @@ function vGelirGider() {
   • Tedarikçiye yapılan ödeme ayrıca gider sayılmaz (faturası zaten gider). Virman, kart borç ödemesi, pazaryeri ödemeleri ve ortak/şahsi hareketler hesaba girmez.<br>
   • <b>KDV dahil</b> = cebinizden çıkan/giren para. <b>KDV hariç</b> = muhasebe kârına yakın bakış (satış ve alış KDV'siz, devlete ödenen KDV hariç).</div></div>`;
   $('#svat').onchange = e => { const v = parseTR(e.target.value); if (!isNaN(v) && v >= 0 && v < 100) { try { localStorage.setItem('tt_sales_vat', String(v)); } catch { } vGelirGider(); } };
+  ggManualCard(y);
   const xr = (rows) => rows.map(r => [r.cat, ...months.map(m => r2(r.m[m])), r2(sum(r.m))]);
   const xt = (l, a) => [l, ...months.map(m => r2(a[m])), r2(sum(a))];
   $('#ex').onclick = () => xlsxDownload('Gelir_Gider_' + y + (dahil ? '_KDV_dahil' : '_KDV_haric'), [['Kalem', ...months.map(m => AY[m]), 'Toplam'], ['GELİRLER'], ...xr(gg.gelir), xt('Toplam gelir', tg), ['İŞLETME GİDERLERİ'], ...xr(gg.gider), xt('Toplam işletme gideri', tx), xt('FAALİYET SONUCU', fs), ['YATIRIM / DEMİRBAŞ'], ...xr(gg.yatirim), xt('Toplam yatırım', ty), ['KÂR ÜZERİNDEN VERGİ'], ...xr(gg.vergi), xt('NET NAKİT SONUCU', net)]);
+}
+// Gelir – Gider sekmesinde elle gelir / gider girişi (açıklamalı, ödeme kanallı)
+const GG_GELIR = ['Nakit satış', 'POS tahsilatı', 'Diğer gelir'];
+const GG_GIDER = () => Object.keys(TX_CATS).filter(c => TX_CATS[c] === 'gider' && c !== 'Sınıflanmamış');
+let GGM = { kind: 'gider' };
+function ggManualCard(y) {
+  const list = S.tx.filter(t => t.src === 'manual' && t.date.startsWith(y) && ['gelir', 'gider'].includes(TX_CATS[t.cat]) && !(t.acc === KASA_ACC && t.file === 'kasa')).sort((a, b) => b.date.localeCompare(a.date));
+  const ro = canWrite() ? '' : 'disabled';
+  $('#view').insertAdjacentHTML('afterbegin', `<div class="card"><h2>Elle gelir / gider girişi</h2>
+    <div class="tools">
+      <select id="gk" style="padding:7px"><option value="gelir">Gelir</option><option value="gider">Gider</option></select>
+      <input type="text" id="gd" value="${dTR(todayISO())}" placeholder="GG.AA.YYYY" style="width:110px;min-width:0">
+      <input type="text" id="ga" placeholder="Tutar" style="width:120px;min-width:0">
+      <select id="gc" style="padding:7px"></select>
+      <span id="gchw"></span>
+      <input type="text" id="gn" placeholder="Açıklama (zorunlu)" style="flex:1;min-width:200px">
+      <button class="btn" id="gb" ${ro}>Ekle</button></div>
+    <div class="mut">Nakit kayıtlar Kasa'ya işlenir. EFT/Havale ve kredi kartı kayıtları, o bankanın ekstresi yüklendiğinde aynı tutar (±1 ₺) ve tarih (±7 gün) ile eşleşirse iki kez sayılmaz.</div>
+    ${list.length ? `<div class="tw" style="max-height:220px;margin-top:8px"><table><tr><th>Tarih</th><th>Tür</th><th>Kategori</th><th>Kanal</th><th>Açıklama</th><th class="n">Tutar</th><th>Ekstre</th><th></th></tr>
+    ${list.map(t => { const d = t.dup ? S.tx.find(x => x.k === t.dup) : null; return `<tr><td>${dTR(t.date)}</td><td>${TX_CATS[t.cat] === 'gelir' ? 'Gelir' : 'Gider'}</td><td>${esc(t.cat)}</td><td>${esc(chLabel(t.acc))}</td><td>${esc(t.desc)}</td><td class="n ${t.amt >= 0 ? 'pos' : 'neg'}">${fmt(t.amt)}</td><td>${d ? `<span class="tag" title="${esc(d.acc + ' – ' + d.desc)}">ekstrede var (bir kez sayıldı)</span>` : ''}</td><td><button class="btn red" style="padding:2px 8px" ${ro} onclick="paySil('${esc(t.k)}',vGelirGider)">Sil</button></td></tr>`; }).join('')}</table></div>` : ''}
+  </div>`);
+  const sync = () => {
+    const k = $('#gk').value; GGM.kind = k;
+    $('#gc').innerHTML = (k === 'gelir' ? GG_GELIR : GG_GIDER()).map(c => `<option>${c}</option>`).join('');
+    $('#gchw').innerHTML = chPicker('gch', k === 'gelir' ? 'gelir' : 'odeme'); chWire('gch');
+    if (k === 'gelir') { $('#gch').value = 'nakit'; chWire('gch'); }
+  };
+  $('#gk').value = GGM.kind; $('#gk').onchange = sync; sync();
+  $('#gb').onclick = () => {
+    if (!guard()) return;
+    const m = $('#gd').value.trim().match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/); const a = parseTR($('#ga').value); const desc = $('#gn').value.trim();
+    if (!m || isNaN(a) || a <= 0) return toast('Tarih (GG.AA.YYYY) ve tutar gerekli', true);
+    if (!desc) return toast('Açıklama yazın', true);
+    const iso = `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`; const gel = $('#gk').value === 'gelir'; const ch = chRead('gch');
+    addManualTx({ date: iso, amt: gel ? a : -a, ch, cat: $('#gc').value, party: null, desc, file: 'elle' });
+    reclassifyAll(); save(); initYears(); toast(`${gel ? 'Gelir' : 'Gider'} eklendi: ${fmt(a)} ₺ · ${CH[ch].l}`); vGelirGider();
+  };
 }
 function ggCell(side, idx, m) {
   const r = ({ g: GGD.gelir, x: GGD.gider, y: GGD.yatirim, v: GGD.vergi })[side][idx]; const it = [...r.items[m]].sort((a, b) => b.a - a.a);
@@ -856,7 +1084,7 @@ function planMatch(p) {
   // ödeme, faturanın kesildiği günden (fatura yoksa vadeden 30 gün önceden) sonra olmalı
   const inv = p.invoice_no ? S.invoices.find(i => i.no === p.invoice_no && i.vkn === p.party) : null;
   const from = inv ? inv.date : addDays(p.due, -30);
-  return S.tx.find(t => t.party === p.party && t.cat === 'Tedarikçi ödemesi' && Math.abs(Math.abs(txAmt(t)) - p.amount) <= 1 && t.date >= from && !used.has(t.k)) || null;
+  return S.tx.find(t => t.party === p.party && t.cat === 'Tedarikçi ödemesi' && !t.dup && t.src !== 'manual' && Math.abs(Math.abs(txAmt(t)) - p.amount) <= 1 && t.date >= from && !used.has(t.k)) || null;
 }
 function dueSummary() {
   const t = todayISO(); const open = (S.planned || []).filter(p => p.status === 'bekliyor');
@@ -887,20 +1115,21 @@ function vVadeler() {
     <button class="btn" id="vnew">+ Yeni planlı ödeme</button></div>
     <datalist id="plist2">${partyOpts.map(n => `<option value="${esc(n)}">`).join('')}</datalist>
     <div class="tw"><table id="vt"></table></div>
-    <div class="mut" style="margin-top:8px">"Bankada görünüyor": aynı cariye, aynı tutarda (±1 ₺) bir banka/kart ödemesi bulundu; kontrol edip "Ödendi" diyebilirsiniz.</div></div>`;
+    <div class="mut" style="margin-top:8px">"Ödendi…" ödeme kanalını (EFT/Havale – Ziraat / Garanti / Yapı Kredi, Nakit, Ziraat / Garanti / Yapı Kredi kredi kartı) sorar ve ödemeyi cariye işler. Yeşil ✓: aynı cariye aynı tutarda (±1 ₺) bir banka/kart ödemesi zaten var; "Ödendi…" ekranında yeni kayıt girmeden onunla eşleyebilirsiniz.</div></div>`;
   $('#vst').value = VF.st;
   const draw = () => {
     const q = norm(VF.q);
+    const paidBy = new Map(); for (const x of S.tx) { if (x.src !== 'manual') continue; const pid = fileTag(x.file, 'plan'); if (pid) { if (!paidBy.has(pid)) paidBy.set(pid, []); paidBy.get(pid).push(x); } }
     const rows = all.filter(p => (!VF.st || p.status === VF.st) && (!q || norm(pName(p.party) + ' ' + (p.invoice_no || '') + ' ' + p.descr).includes(q))).sort((a, b) => a.due.localeCompare(b.due));
-    $('#vt').innerHTML = `<tr><th>Vade</th><th>Durum</th><th>Cari</th><th>Fatura / açıklama</th><th class="n">Tutar</th><th>Banka eşleşmesi</th><th></th></tr>` +
+    $('#vt').innerHTML = `<tr><th>Vade</th><th>Durum</th><th>Cari</th><th>Fatura / açıklama</th><th class="n">Tutar</th><th>Ödeme / banka eşleşmesi</th><th></th></tr>` +
       rows.map(p => {
         const dd = daysBetween(t, p.due); const m = p.status === 'bekliyor' ? planMatch(p) : null;
         const st = p.status !== 'bekliyor' ? `<span class="tag">${p.status === 'tamamlandi' ? 'ödendi' : 'iptal'}</span>` : dd < 0 ? `<span class="tag w" style="background:#fde8e6;color:var(--neg)">${-dd} gün gecikti</span>` : dd === 0 ? '<span class="tag w">bugün</span>' : `<span class="tag">${dd} gün kaldı</span>`;
         return `<tr><td>${dTR(p.due)}${p.recurrence && p.recurrence !== 'yok' ? ` <span class="tag">${p.recurrence}</span>` : ''}</td><td>${st}</td><td>${p.party ? `<a href="javascript:void 0" onclick="cariEkstre('${esc(p.party)}')">${esc(pName(p.party))}</a>` : ''}</td>
         <td>${esc(p.invoice_no || '')}<div class="mut" style="font-size:12px">${esc((p.descr || '').replace(/^.*·\s*/, '').slice(0, 60) === (p.invoice_no || '') ? '' : (p.descr || '').slice(0, 70))}</div></td>
         <td class="n"><b>${fmt(p.amount)}</b></td>
-        <td>${m ? `<span class="tag" style="background:#e3f4e8;color:var(--pos)" title="${esc(m.desc)}">✓ ${dTR(m.date)} ${esc(m.acc.split(' ')[0])} ${fmt(-txAmt(m))}</span>` : ''}</td>
-        <td style="white-space:nowrap">${p.status === 'bekliyor' ? `<button class="btn sec" onclick="planSet('${esc(p.id)}','tamamlandi'${m ? `,'${esc(m.k)}'` : ''})">Ödendi</button> <button class="btn red" onclick="planSet('${esc(p.id)}','iptal')">İptal</button>` : `<button class="btn sec" onclick="planSet('${esc(p.id)}','bekliyor')">Geri al</button>`}</td></tr>`;
+        <td>${m ? `<span class="tag" style="background:#e3f4e8;color:var(--pos)" title="${esc(m.desc)}">✓ ${dTR(m.date)} ${esc(m.acc.split(' ')[0])} ${fmt(-txAmt(m))}</span>` : ''}${(paidBy.get(p.id) || []).map(x => `<span class="tag" title="${esc(x.desc)}">${esc(chLabel(x.acc))} · ${dTR(x.date)} · ${fmt(-x.amt)}</span>`).join(' ')}</td>
+        <td style="white-space:nowrap">${p.status === 'bekliyor' ? `<button class="btn sec" onclick="payForm({plan:'${esc(p.id)}',after:vVadeler})">Ödendi…</button> <button class="btn red" onclick="planSet('${esc(p.id)}','iptal')">İptal</button>` : `<button class="btn sec" onclick="planSet('${esc(p.id)}','bekliyor')">Geri al</button>`}</td></tr>`;
       }).join('') + `<tr class="tot"><td colspan="4">${rows.length} kayıt</td><td class="n">${fmt(sum(rows, p => p.amount))}</td><td colspan="2"></td></tr>`;
   };
   $('#vst').onchange = e => { VF.st = e.target.value; draw(); }; $('#vq').oninput = e => { VF.q = e.target.value; draw(); };
@@ -910,15 +1139,24 @@ function vVadeler() {
 function planSet(id, status, matchK) {
   if (!guard()) return;
   const p = (S.planned || []).find(x => x.id === id); if (!p) return;
-  p.status = status; if (matchK) p.matchK = matchK; if (status === 'bekliyor') delete p.matchK; mark('plan', id);
-  if (status === 'tamamlandi' && p.recurrence && p.recurrence !== 'yok') {
+  if (status === 'bekliyor') {
+    const mt = S.tx.filter(t => t.src === 'manual' && fileTag(t.file, 'plan') === id);
+    if (mt.length && confirm(`Bu vade için elle girilen ${mt.length} ödeme kaydı da silinsin mi? (${mt.map(t => dTR(t.date) + ' ' + chLabel(t.acc) + ' ' + fmt(-t.amt)).join(', ')})`)) { mt.forEach(t => delManualTx(t.k)); reclassifyAll(); }
+  }
+  if (status === 'tamamlandi') planDone(p, matchK);
+  else { p.status = status; if (status === 'bekliyor') delete p.matchK; mark('plan', id); }
+  save(); vVadeler();
+}
+// vadeyi "ödendi" yapar; tekrarlı ise bir sonrakini ekler
+function planDone(p, matchK) {
+  p.status = 'tamamlandi'; if (matchK) p.matchK = matchK; mark('plan', p.id);
+  if (p.recurrence && p.recurrence !== 'yok') {
     const nd = nextDue(p.due, p.recurrence);
     if (nd && !(S.planned.some(x => x.status === 'bekliyor' && x.party === p.party && x.due === nd && x.amount === p.amount))) {
       const np = { id: 'T:' + Date.now(), kind: p.kind, due: nd, amount: p.amount, party: p.party, invoice_no: '', descr: p.descr, status: 'bekliyor', recurrence: p.recurrence, src: 'TT' };
       S.planned.push(np); mark('plan', np.id); toast('Sonraki tekrar eklendi: ' + dTR(nd));
     }
   }
-  save(); vVadeler();
 }
 function planNewForm() {
   openModal(`<h3>Yeni planlı ödeme</h3><div class="tools" style="flex-direction:column;align-items:stretch;max-width:420px">
@@ -942,7 +1180,7 @@ function planFromInvoices() {
   if (!guard()) return;
   const t = todayISO(); const have = new Set((S.planned || []).map(p => p.invoice_no).filter(Boolean));
   // faturada vade yoksa carinin ödeme vadesi (gün) kullanılır
-  const dueOf = i => (i.due && /^\d{4}-\d{2}-\d{2}$/.test(i.due)) ? i.due : (S.parties[i.vkn] && S.parties[i.vkn].term != null ? addDays(i.date, S.parties[i.vkn].term) : '');
+  const dueOf = i => (i.due && /^\d{4}-\d{2}-\d{2}$/.test(i.due)) ? i.due : (termOf(i.vkn) != null ? addDays(i.date, termOf(i.vkn)) : '');
   const cand = S.invoices.filter(i => dueOf(i) >= t && !have.has(i.no) && i.pay > 0).map(i => Object.assign({}, i, { due: dueOf(i) }));
   if (!cand.length) return toast('Vadesi bugünden sonra olan, planı olmayan e-fatura yok.');
   if (!confirm(`${cand.length} vadeli e-fatura için plan oluşturulsun mu? (Toplam ${fmt(sum(cand, i => i.pay))} ₺)`)) return;
