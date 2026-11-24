@@ -1584,4 +1584,21 @@ function xlsxDownload(name, aoa) { const ws = XLSX.utils.aoa_to_sheet(aoa); cons
 
 const VIEWS = { ozet: vOzet, faturalar: vFaturalar, urunler: vUrunler, cari: vCari, vadeler: vVadeler, kasa: vKasa, kullanicilar: vKullanicilar, banka: vBanka, gelirgider: vGelirGider, stok: vStok, yukle: vYukle };
 window.addEventListener('hashchange', () => { const k = location.hash.slice(1); if (k && k !== CUR && VIEWS[k]) go(k); });
+// Yeni sürüm kontrolü: tarayıcı sayfanın eski kopyasını tutuyorsa sunucudakini indirip sayfayı yeniler
+// (açılışta ve her 30 dakikada bir; sadece web sürümünde)
+const APP_V = (() => { const s = [...document.scripts].find(x => /app\.js\?v=/.test(x.src)); return s ? s.src.split('v=')[1] : ''; })();
+async function checkUpdate() {
+  if (!/^https?:/.test(location.protocol) || !APP_V) return;
+  try {
+    const h = await (await fetch(location.pathname, { cache: 'reload' })).text();
+    const m = h.match(/app\.js\?v=([\w.]+)/); if (!m || m[1] === APP_V) return;
+    if (sessionStorage.getItem('tt_upd') === m[1]) return; // döngü olmasın
+    sessionStorage.setItem('tt_upd', m[1]);
+    if (pendCount()) await flushCloud().catch(() => { });
+    const busy = !$('#modal').classList.contains('hidden') || (document.activeElement && /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName));
+    if (busy) toast('Programın yeni sürümü var: işinizi bitirince sayfayı yenileyin (F5).');
+    else location.reload();
+  } catch { }
+}
+setTimeout(checkUpdate, 3000); setInterval(checkUpdate, 30 * 60000);
 boot();
